@@ -17,13 +17,14 @@
 
 ---
 
-## The three outcomes
+## The four outcomes
 
 | Traffic type | `--violation-id` | Outcome | Trap |
 |--------------|------------------|---------|------|
 | Legit        | empty            | ALLOW   | none |
 | Legit        | value        | REPORT-ONLY | forward trap, named by value |
 | Attack       | value            | BLOCK   | high-drop trap, named by value |
+| Attack       | empty            | BLOCK   | high-drop trap, named `MCP FW` |
 
 ---
 
@@ -69,6 +70,15 @@ curl -vk https://1.1.2.2/ -H "X-RDWR-Attack: 1"
 ```bash
 # server
 nohup python3 /root/http_avro_server.py --mode https --port 4433 --action deny --deny-header "X-RDWR-Attack" --violation-id "fw" --log /root/server_access.log --ip 2.2.2.2 --key /root/client.key --cert /root/client.crt --mtls --trust-ca /root/ca.crt > /root/mockup_server_output.log 2>&1 &
+# traffic
+curl -vk https://1.1.2.2/ -H "X-RDWR-Attack: anything"
+```
+➡️ BLOCK → high-drop trap `MCP FW` (no forward).
+
+**BLOCK (FW, empty violation-id)** — attack traffic (header present), violation-id empty:
+```bash
+# server
+nohup python3 /root/http_avro_server.py --mode https --port 4433 --action deny --deny-header "X-RDWR-Attack" --violation-id "" --log /root/server_access.log --ip 2.2.2.2 --key /root/client.key --cert /root/client.crt --mtls --trust-ca /root/ca.crt > /root/mockup_server_output.log 2>&1 &
 # traffic
 curl -vk https://1.1.2.2/ -H "X-RDWR-Attack: anything"
 ```
