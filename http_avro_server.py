@@ -3,8 +3,8 @@
 Python HTTP/S Avro Server
 Handles schema validation, decompression of HTTP payloads (auto-detects
 zlib / gzip / raw-deflate), configurable logging, custom response action
-modes (allow/deny), optional chunked deny responses, optional modified_data
-for allow responses, and HTTPS with mutual TLS (mTLS).
+modes (allow/deny/report-only), optional chunked responses, optional
+modified_data for allow responses, and HTTPS with mutual TLS (mTLS).
 """
 
 import sys
@@ -90,20 +90,29 @@ _LOG_WRITE_LOCK = threading.Lock()
 ALLOW_MODIFIED_HEADER_NAME = b"X-RDWR-CHANGED-REQ"
 ALLOW_MODIFIED_HEADER_LINE = b"X-RDWR-CHANGED-REQ: True"
 ALLOW_MODIFIED_BODY_MARKER = b"\r\nBODY WAS MODIFIED"
+# MCPP decisions use pass plus an optional violation ID / Modify flag, or block.
+ACTION_HEADER_NAME = "X-Rdwr-Action"
+VIOLATION_ID_HEADER_NAME = "X-RDWR-VIOLATION-ID"
+MODIFY_HEADER_NAME = "X-Rdwr-Modify"
+VIOLATION_ID = "mccp injection"
 
 # ---------------------------------------------------------------------------
 # Selective block-by-inner-header
 #
 # Blocking is decided by inspecting the ACTUAL HTTP request that the client
 # sent to the PSSLO (the decompressed Avro payload), NOT the outer Avro
-# transport headers and NOT the PSSLO's APP-ID. This lets the SAME PSSLO carry
-# both legit AND attack traffic: a request is DENIED only when it carries a
-# special marker header that a normal CURL command would never send. Every
-# other request on that same PSSLO is ALLOWED.
+# transport headers. This lets the SAME PSSLO carry both legit AND attack
+# traffic: a request is DENIED only when it carries a special marker header
+# that a normal CURL command would never send. Every other request on that
+# same PSSLO is ALLOWED. This replaces the fixed --action allow/deny behavior
+# whenever --deny-header is configured.
 #
 # Default marker header (does not exist in a plain CURL request):
 #   X-RDWR-Attack: 1
-# The header NAME is what matters; its value is ignored.
+# The header NAME is what matters; its value is ignored, e.g. both
+#   curl ... -H "X-RDWR-Attack: 1"
+#   curl ... -H "X-RDWR-Attack: anything"
+# are treated as attack traffic.
 # ---------------------------------------------------------------------------
 DEFAULT_DENY_HEADER_NAME = "X-RDWR-Attack"
 
@@ -413,7 +422,6 @@ def write_request_log(
     method=None,
     path=None,
     compression_format=None,
-    action=None,
 ):
     """Append success/failure request details to the configured log file."""
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
@@ -428,8 +436,6 @@ def write_request_log(
     if method or path:
         parts.append(f"Method: {method or '(unknown)'}\n")
         parts.append(f"Path: {path or '(unknown)'}\n")
-    if action:
-        parts.append(f"Action: {action.upper()}\n")
 
     if status == "FAILURE":
         parts.append("\n--- FAILURE REASON ---\n")
@@ -488,21 +494,40 @@ class AvroHTTPRequestHandler(BaseHTTPRequestHandler):
         pass
 
     def resolve_action(self, uncompressed_data=None):
-        """Decide the effective action ("allow"/"deny") for the current request.
+        """Decide the effective action ("allow"/"report-only"/"deny").
 
         When --deny-header is configured (default: X-RDWR-Attack) the server
         runs in selective mode and inspects the ACTUAL HTTP request the client
-        sent to the PSSLO (the decompressed Avro payload). If that inner request
-        carries the marker header, the request is DENIED; otherwise it is
-        ALLOWED. This lets the SAME PSSLO carry both legit and attack traffic.
-        When selective mode is disabled, the global --action is used.
+        sent to the PSSLO (the decompressed Avro payload). The decision is:
+
+          * DENY (block)       -> inner request carries the marker header
+                                  (attack traffic).
+          * REPORT-ONLY (pass) -> legit traffic (no marker header) AND a
+                                  non-empty X-RDWR-VIOLATION-ID is configured
+                                  (--violation-id=<value>): the request is
+                                  passed but reported (not enforced).
+          * ALLOW (pass)       -> legit traffic (no marker header) AND the
+                                  violation ID is empty/omitted.
+
+        This lets the SAME PSSLO carry legit (allow/report-only) and attack
+        (block) traffic. When selective mode is disabled, the global --action
+        is used.
         """
         deny_header = getattr(self.server, "config_deny_header", None)
         if not deny_header:
             return self.server.config_action
 
         has_marker = inner_request_has_header(uncompressed_data, deny_header)
-        action = "deny" if has_marker else "allow"
+        if has_marker:
+            action = "deny"
+        else:
+            # Legit traffic: report-only when a non-empty violation ID is
+            # configured, otherwise a plain allow.
+            violation_id = self.server.config_violation_id
+            if violation_id:
+                action = "report-only"
+            else:
+                action = "allow"
 
         print(
             f"[+] Selective action: inner header {deny_header!r} "
@@ -580,11 +605,10 @@ class AvroHTTPRequestHandler(BaseHTTPRequestHandler):
                     f"Error={e}"
                 )
 
-            # Determine the effective action for THIS request. When
-            # --deny-header is configured the server works in selective mode:
-            # it inspects the decompressed inner HTTP request for the marker
-            # header and denies only those, allowing everything else. This lets
-            # the same PSSLO carry both legit and attack traffic.
+            # When --deny-header is set, selective mode inspects the inner
+            # (decompressed) HTTP request and denies only those carrying the
+            # marker header, allowing everything else. Otherwise the global
+            # --action is used.
             effective_action = self.resolve_action(uncompressed_data)
 
             if effective_action == "allow" and self.server.config_allow_modified_data:
@@ -603,23 +627,20 @@ class AvroHTTPRequestHandler(BaseHTTPRequestHandler):
                     method=self.command,
                     path=self.path,
                     compression_format=compression_format,
-                    action=effective_action,
                 )
 
             # Respond using the SAME compression format we detected on the way
             # in, so the response round-trips through whatever the ADC side
             # currently expects without needing a separate config flag.
             response_compression_format = compression_format or "zlib"
+            violation_id = self.server.config_violation_id
 
-            if effective_action == "allow":
-                response_record = {
-                    "action": "allow",
-                    "violation_id": None,
-                    "modified_data": compress_payload(modified_allow_data, response_compression_format)
-                    if self.server.config_allow_modified_data
-                    else None,
-                }
-            else:
+            if effective_action == "deny":
+                rdwr_action = "block"
+                # In selective mode an allow-defaulted config leaves violation_id
+                # as None; fall back to the standard violation ID for blocks.
+                if violation_id is None:
+                    violation_id = VIOLATION_ID
                 block_html = (
                     "<html>\n"
                     "<head><title>403 Forbidden</title></head>\n"
@@ -634,6 +655,8 @@ class AvroHTTPRequestHandler(BaseHTTPRequestHandler):
                     "HTTP/1.1 403 Forbidden\r\n"
                     "Content-Type: text/html; charset=utf-8\r\n"
                     f"Content-Length: {len(block_html.encode('utf-8'))}\r\n"
+                    f"{ACTION_HEADER_NAME}: {rdwr_action}\r\n"
+                    f"{VIOLATION_ID_HEADER_NAME}: {violation_id}\r\n"
                     "Connection: close\r\n"
                     "\r\n"
                     f"{block_html}"
@@ -641,17 +664,58 @@ class AvroHTTPRequestHandler(BaseHTTPRequestHandler):
 
                 response_record = {
                     "action": "deny",
-                    "violation_id": "blocked request",
+                    "violation_id": violation_id,
                     "modified_data": compress_payload(raw_http_response, response_compression_format),
+                }
+            else:
+                # Legit traffic. Two sub-cases decided in resolve_action():
+                #   * report-only -> a non-empty violation ID is configured, so
+                #     the request is PASSED but reported (X-Rdwr-Action: pass +
+                #     X-RDWR-VIOLATION-ID set). Not enforced.
+                #   * allow       -> violation ID empty/omitted, so the request
+                #     is PASSED with no violation reported.
+                rdwr_action = "pass"
+                if effective_action == "report-only":
+                    # Ensure a violation is reported even if selective mode left
+                    # the stored config as a falsy/None default.
+                    if not violation_id:
+                        violation_id = VIOLATION_ID
+                    print(
+                        f"[+] REPORT-ONLY: passing legit request but reporting "
+                        f"violation_id={violation_id!r} "
+                        f"(client {self.client_address[0]}:{self.client_address[1]})"
+                    )
+                else:
+                    # Pure allow: never emit a violation header.
+                    violation_id = None
+                    print(
+                        f"[+] ALLOW: passing legit request with no violation "
+                        f"(client {self.client_address[0]}:{self.client_address[1]})"
+                    )
+                response_record = {
+                    "action": "allow",
+                    "violation_id": violation_id,
+                    "modified_data": compress_payload(modified_allow_data, response_compression_format)
+                    if modified_allow_data is not None
+                    else None,
                 }
 
             response_bytes = encode_avro_response(response_record, use_container=was_container)
 
-            if response_record["action"] == "deny" and self.server.config_chunked:
-                self.send_chunked_avro_response(response_bytes)
+            # Outer HTTP headers the caller uses to decide enforce vs. report-only.
+            response_headers = [(ACTION_HEADER_NAME, rdwr_action)]
+            if violation_id is not None:
+                response_headers.append((VIOLATION_ID_HEADER_NAME, violation_id))
+            if self.server.config_modify is not None:
+                response_headers.append((MODIFY_HEADER_NAME, self.server.config_modify))
+
+            if self.server.config_chunked:
+                self.send_chunked_avro_response(response_bytes, response_headers)
             else:
                 self.send_response(200)
                 self.send_header("Content-Type", "avro/binary")
+                for name, value in response_headers:
+                    self.send_header(name, value)
                 self.send_header("Content-Length", str(len(response_bytes)))
                 self.end_headers()
                 self.wfile.write(response_bytes)
@@ -721,16 +785,17 @@ class AvroHTTPRequestHandler(BaseHTTPRequestHandler):
         except CONNECTION_ERRORS as write_err:
             print(f"[-] Client disconnected while sending error response: {write_err}", file=sys.stderr)
 
-    def send_chunked_avro_response(self, response_bytes):
+    def send_chunked_avro_response(self, response_bytes, response_headers):
         """
         Send the Avro response payload using HTTP chunked transfer encoding.
 
         The Avro bytes are unchanged. Only the outer HTTP response uses chunked
-        framing instead of Content-Length. This is used only when --action deny
-        and --chunked are both enabled.
+        framing instead of Content-Length. Used when --chunked is enabled, for any action.
         """
         self.send_response(200)
         self.send_header("Content-Type", "avro/binary")
+        for name, value in response_headers:
+            self.send_header(name, value)
         self.send_header("Transfer-Encoding", "chunked")
         self.end_headers()
 
@@ -763,25 +828,6 @@ class AvroThreadingHTTPServer(ThreadingHTTPServer):
     # kernel to reject new connections before Python can log them.
     request_queue_size = socket.SOMAXCONN
     daemon_threads = True
-    # Allow re-binding quickly after a restart (avoids "Address already in use").
-    allow_reuse_address = True
-
-    def server_bind(self):
-        """Bind the listening socket, enabling IPv6 dual-stack when possible.
-
-        When the server is created with an IPv6 address family and bound to the
-        IPv6 wildcard ("::"), we clear IPV6_V6ONLY so the single listening
-        socket accepts BOTH IPv6 and IPv4 (the latter as IPv4-mapped addresses,
-        e.g. ::ffff:1.2.3.4). On platforms/addresses where that isn't allowed,
-        we fall back to IPv6-only silently.
-        """
-        if self.address_family == socket.AF_INET6:
-            try:
-                self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
-            except (AttributeError, OSError) as e:
-                print(f"[-] Could not enable IPv4/IPv6 dual-stack, continuing IPv6-only: {e}",
-                      file=sys.stderr)
-        super().server_bind()
 
     def get_request(self):
         """Accept a socket and defer TLS handshaking to its worker thread.
@@ -818,15 +864,6 @@ class AvroThreadingHTTPServer(ThreadingHTTPServer):
             )
             return
         super().handle_error(request, client_address)
-
-
-def _resolve_address_family(ip):
-    """Return the socket address family (AF_INET / AF_INET6) for a bind IP.
-
-    An IP literal containing ':' (e.g. "::", "::1", "2001:db8::1", or "%zone")
-    is treated as IPv6; everything else (e.g. "0.0.0.0", "127.0.0.1") as IPv4.
-    """
-    return socket.AF_INET6 if ":" in ip else socket.AF_INET
 
 
 def generate_certificates():
@@ -892,23 +929,20 @@ def main():
     parser.add_argument("--key", help="Path to server SSL private key (required for HTTPS)")
     parser.add_argument("--mtls", action="store_true", help="Enable mutual TLS (request/verify client certificate)")
     parser.add_argument("--trust-ca", help="Path to CA certificate file to validate client cert (required for mTLS)")
-    parser.add_argument("--action", choices=["allow", "deny"], default="allow", help="Outcome response mode (default: allow)")
+    parser.add_argument("--action", choices=["allow", "deny", "report-only"], default="allow", help="Outcome response mode: allow, deny (block), or report-only (pass, reported but not enforced) (default: allow)")
     parser.add_argument(
         "--deny-header",
-        nargs="?",
-        const=DEFAULT_DENY_HEADER_NAME,
         default=DEFAULT_DENY_HEADER_NAME,
-        help="Selective block mode. Inspect the DECOMPRESSED inner HTTP request "
-             "(the actual request the client sent to the PSSLO) and DENY it only "
-             "when it contains this header NAME; all other requests are ALLOWED. "
-             "This lets the SAME PSSLO carry both legit and attack traffic. "
-             "Matching is case-insensitive and the header value is ignored. "
-             f"Default: '{DEFAULT_DENY_HEADER_NAME}'. "
-             "Pass an empty string (--deny-header '') to disable selective mode "
-             "and fall back to the global --action.",
+        help="Selective mode: DENY a request only when its inner (decompressed) HTTP "
+             "request carries this header NAME (value ignored); ALLOW everything else. "
+             "This lets the same PSSLO carry both legit and attack traffic and replaces "
+             f"the fixed --action allow/deny. Default: '{DEFAULT_DENY_HEADER_NAME}'. "
+             "Pass an empty string (--deny-header '') to disable selective mode and use --action.",
     )
-    parser.add_argument("--chunked", action="store_true", help="With --action deny, send the Avro response body using HTTP chunked transfer encoding")
+    parser.add_argument("--chunked", action="store_true", help="Send the Avro response body using HTTP chunked transfer encoding (any --action)")
     parser.add_argument("--allow-modified-data", action="store_true", help="With --action allow, return compressed modified_data containing the original uncompressed request plus header X-RDWR-CHANGED-REQ: True and append BODY WAS MODIFIED to any non-empty body")
+    parser.add_argument("--violation-id", help="Override X-RDWR-VIOLATION-ID independently of --action; --violation-id= emits an explicit empty header (default: omitted for allow, mccp injection otherwise)")
+    parser.add_argument("--modify", choices=["true", "false"], help="Emit X-Rdwr-Modify independently of --action and replacement data (default: true with --allow-modified-data, omitted otherwise)")
     parser.add_argument("--log", default="server_access.log", help="Path to output full request log file (default: server_access.log)")
     parser.add_argument("--error-log", action="store_true", help="Write only error logs; successful requests are not logged")
     parser.add_argument("--generate-certs", action="store_true", help="Generate helper Root CA / client / server PKI files in 'certs/' and exit")
@@ -935,9 +969,6 @@ def main():
         if not args.trust_ca:
             parser.error("mTLS requires a trusted root CA certificate (--trust-ca) to validate client certs.")
 
-    if args.chunked and args.action != "deny":
-        parser.error("--chunked is only relevant with --action deny.")
-
     if args.allow_modified_data and args.action != "allow":
         parser.error("--allow-modified-data is only relevant with --action allow.")
 
@@ -945,27 +976,35 @@ def main():
     FORCE_COMPRESSION_FORMAT = None if args.compression_format == "auto" else args.compression_format
 
     # The header NAME whose presence in the inner (decompressed) HTTP request
-    # triggers a DENY. Empty/blank disables selective mode (global --action).
+    # triggers a DENY. Empty/blank disables selective mode (falls back to --action).
     deny_header = (args.deny_header or "").strip() or None
 
     # ThreadingHTTPServer handles each connection in its own daemon thread so
     # slow/concurrent clients don't block one another (the plain HTTPServer
     # processes requests one at a time on a single thread).
-    #
-    # Pick the socket address family from the bind IP so the server can run on
-    # IPv4 or IPv6. A literal with ':' (e.g. "::", "::1", "2001:db8::1") binds
-    # IPv6; otherwise IPv4. Binding to the IPv6 wildcard "::" also accepts IPv4
-    # clients via dual-stack (see AvroThreadingHTTPServer.server_bind).
-    address_family = _resolve_address_family(args.ip)
-    AvroThreadingHTTPServer.address_family = address_family
-
     server = AvroThreadingHTTPServer((args.ip, args.port), AvroHTTPRequestHandler)
     server.config_log_path = args.log
     server.config_error_log = args.error_log
     server.config_action = args.action
+    server.config_deny_header = deny_header
     server.config_chunked = args.chunked
     server.config_allow_modified_data = args.allow_modified_data
-    server.config_deny_header = deny_header
+    # None means omitted, whereas an empty string must remain an explicit header.
+    server.config_violation_id = args.violation_id
+    # In selective mode (--deny-header active), report-only vs allow is driven
+    # SOLELY by --violation-id, so --action must NOT seed a default violation ID
+    # (otherwise legit traffic would be classified report-only instead of allow).
+    # Only when selective mode is OFF does --action deny/report-only seed the
+    # standard violation ID.
+    if (
+        server.config_violation_id is None
+        and deny_header is None
+        and args.action != "allow"
+    ):
+        server.config_violation_id = VIOLATION_ID
+    server.config_modify = args.modify
+    if server.config_modify is None and args.allow_modified_data:
+        server.config_modify = "true"
 
     protocol_label = "HTTP"
     server.ssl_context = None
@@ -987,26 +1026,21 @@ def main():
         server.ssl_context = ssl_ctx
 
     print(f"[*] Starting {protocol_label} Avro Server on {args.ip}:{args.port}...")
-    if address_family == socket.AF_INET6:
-        if args.ip in ("::", "::0", "0:0:0:0:0:0:0:0"):
-            print("[*] Network stack: IPv6 wildcard bind (dual-stack: accepts IPv6 AND IPv4 clients)")
-        else:
-            print("[*] Network stack: IPv6")
-    else:
-        print("[*] Network stack: IPv4")
     print(f"[*] Configured log path: {args.log}")
     if args.error_log:
         print("[*] Successful requests will not be logged.")
     print(f"[*] Default action mode: {args.action.upper()}")
     if deny_header:
-        print(f"[*] Selective deny-by-inner-header mode: ENABLED")
+        print("[*] Selective deny-by-inner-header mode: ENABLED")
         print(f"[*] Inner HTTP requests containing header '{deny_header}' will be DENIED; "
               f"all others ALLOWED")
     else:
         print("[*] Selective deny-by-inner-header mode: DISABLED "
               f"(using global --action={args.action.upper()})")
-    print(f"[*] Chunked deny responses: {'ENABLED' if args.chunked else 'DISABLED'}")
+    print(f"[*] Chunked responses: {'ENABLED' if args.chunked else 'DISABLED'}")
     print(f"[*] Allow modified_data responses: {'ENABLED' if args.allow_modified_data else 'DISABLED'}")
+    print(f"[*] Violation ID header: {server.config_violation_id!r}")
+    print(f"[*] Modify header: {server.config_modify or '(missing)'}")
     print(f"[*] Compression format: {args.compression_format.upper()}"
           + (" (auto-detect zlib/gzip/raw_deflate)" if args.compression_format == "auto" else ""))
 
